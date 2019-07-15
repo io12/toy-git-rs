@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 use libtoygit::ObjHash as GitHash;
+use libtoygit::ObjType as GitObjType;
 
 use clap::{AppSettings, Arg, ArgMatches, SubCommand};
 
@@ -26,11 +27,23 @@ fn git_init(args: &ArgMatches) -> Result<()> {
 }
 
 fn git_cat_file(args: &ArgMatches) -> Result<()> {
-    let hash = args.value_of("object").expect("no object");
-    let hash = hash.parse::<GitHash>()?;
+    let typ = args
+        .value_of("type")
+        .expect("no type")
+        .parse::<GitObjType>()?;
+    let hash = args
+        .value_of("object")
+        .expect("no object")
+        .parse::<GitHash>()?;
+
     let obj = libtoygit::Obj::read(&hash)?;
-    io::stdout().write_all(&obj.data)?;
-    Ok(())
+
+    if obj.typ == typ {
+        io::stdout().write_all(&obj.data)?;
+        Ok(())
+    } else {
+        error("object does not have specified type")
+    }
 }
 
 fn make_clap_app() -> clap::App<'static, 'static> {
@@ -44,6 +57,11 @@ fn make_clap_app() -> clap::App<'static, 'static> {
         .subcommand(
             SubCommand::with_name("cat-file")
                 .about("Provide content or type and size information for repository objects")
+                .arg(
+                    Arg::with_name("type")
+                        .required(true)
+                        .possible_values(&["blob", "commit", "tag", "tree"]),
+                )
                 .arg(Arg::with_name("object").required(true)),
         )
 }

@@ -9,13 +9,14 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::str;
+use std::str::{self, FromStr};
 
 use compress::zlib;
 pub use sha1::Digest as ObjHash;
 use tini::Ini;
 
 /// The type of a git object
+#[derive(PartialEq, Eq)]
 pub enum ObjType {
     Blob,
     Commit,
@@ -24,6 +25,7 @@ pub enum ObjType {
 }
 
 /// A git object
+#[derive(PartialEq, Eq)]
 pub struct Obj {
     /// Type of the object
     pub typ: ObjType,
@@ -45,16 +47,27 @@ lazy_static! {
         .item("logallrefupdates", "true");
 }
 
-impl ObjType {
-    /// Parse from byte slice
-    fn from_bytes(slice: &[u8]) -> io::Result<Self> {
-        match str::from_utf8(slice) {
-            Ok("blob") => Ok(ObjType::Blob),
-            Ok("commit") => Ok(ObjType::Commit),
-            Ok("tag") => Ok(ObjType::Tag),
-            Ok("tree") => Ok(ObjType::Tree),
+impl FromStr for ObjType {
+    type Err = io::Error;
+
+    /// Parse `ObjType` from `&str`
+    fn from_str(s: &str) -> io::Result<Self> {
+        match s {
+            "blob" => Ok(ObjType::Blob),
+            "commit" => Ok(ObjType::Commit),
+            "tag" => Ok(ObjType::Tag),
+            "tree" => Ok(ObjType::Tree),
             _ => Err(invalid_data_err("invalid object type")),
         }
+    }
+}
+
+impl ObjType {
+    /// Parse from byte slice
+    pub fn from_bytes(slice: &[u8]) -> io::Result<Self> {
+        let res_s = str::from_utf8(slice);
+        let s = res_s.map_err(|_| invalid_data_err("object type is not UTF-8"))?;
+        s.parse::<Self>()
     }
 }
 
