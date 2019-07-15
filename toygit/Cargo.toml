@@ -5,3 +5,6 @@ authors = ["Benjamin Levy <blevy@protonmail.com>"]
 edition = "2018"
 
 [dependencies]
+libtoygit = { path = "../libtoygit" }
+clap = "2.33.0"
+failure = "0.1.5"
