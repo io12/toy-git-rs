@@ -7,4 +7,4 @@ edition = "2018"
 [dependencies]
 libtoygit = { path = "../libtoygit" }
 clap = "2.33.0"
-failure = "0.1.5"
+string-error = "0.1.0"
