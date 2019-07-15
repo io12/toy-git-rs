@@ -23,6 +23,13 @@ lazy_static! {
         .item("logallrefupdates", "true");
 }
 
+/// Write an `Ini` object to a file with a trailing newline
+fn write_ini(ini: &Ini, path: &Path) -> io::Result<()> {
+    let mut s = ini.to_buffer();
+    s.push('\n');
+    fs::write(path, s)
+}
+
 /// Create an empty Git repository or reinitialize an existing one.
 /// This corresponds to `git init`.
 ///
@@ -40,7 +47,7 @@ pub fn init(dir: &Path) -> io::Result<()> {
     fs::create_dir(refs_dir.join("heads"))?;
     fs::create_dir(refs_dir.join("tags"))?;
 
-    DEFAULT_CONFIG.to_file(&git_dir.join("config"))?;
+    write_ini(&DEFAULT_CONFIG, &git_dir.join("config"))?;
     fs::write(git_dir.join("description"), DEFAULT_DESCRIPTION)?;
     fs::File::create(git_dir.join("HEAD"))?; // TODO: write contents
 
