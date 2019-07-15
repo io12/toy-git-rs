@@ -12,6 +12,7 @@ use tini::Ini;
 
 const DEFAULT_DESCRIPTION: &str =
     "Unnamed repository; edit this file 'description' to name the repository.\n";
+const DEFAULT_HEAD: &str = "ref: refs/heads/master\n";
 
 lazy_static! {
     static ref GIT_DIR: OsString = env::var_os("GIT_DIR").unwrap_or_else(|| OsString::from(".git"));
@@ -49,7 +50,7 @@ pub fn init(dir: &Path) -> io::Result<()> {
 
     write_ini(&DEFAULT_CONFIG, &git_dir.join("config"))?;
     fs::write(git_dir.join("description"), DEFAULT_DESCRIPTION)?;
-    fs::File::create(git_dir.join("HEAD"))?; // TODO: write contents
+    fs::write(git_dir.join("HEAD"), DEFAULT_HEAD)?;
 
     Ok(())
 }
