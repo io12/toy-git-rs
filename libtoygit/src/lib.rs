@@ -1,23 +1,26 @@
 #[macro_use]
 extern crate lazy_static;
-extern crate compress;
+extern crate libflate;
 extern crate sha1;
 extern crate tini;
 
 use std::env;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::iter::{self, Iterator};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 
-use compress::zlib;
-pub use sha1::Digest as ObjHash;
+use libflate::zlib;
+pub use sha1::Digest as GitHash;
+pub use sha1::Sha1 as GitHasher;
 use tini::Ini;
 
 /// The type of a git object
 #[derive(PartialEq, Eq)]
-pub enum ObjType {
+pub enum GitObjType {
     Blob,
     Commit,
     Tag,
@@ -26,9 +29,9 @@ pub enum ObjType {
 
 /// A git object
 #[derive(PartialEq, Eq)]
-pub struct Obj {
+pub struct GitObj {
     /// Type of the object
-    pub typ: ObjType,
+    pub typ: GitObjType,
     /// The object's data
     pub data: Vec<u8>,
 }
@@ -47,22 +50,35 @@ lazy_static! {
         .item("logallrefupdates", "true");
 }
 
-impl FromStr for ObjType {
+impl fmt::Display for GitObjType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            GitObjType::Blob => "blob",
+            GitObjType::Commit => "commit",
+            GitObjType::Tag => "tag",
+            GitObjType::Tree => "tree",
+        };
+
+        f.write_str(s)
+    }
+}
+
+impl FromStr for GitObjType {
     type Err = io::Error;
 
-    /// Parse `ObjType` from `&str`
+    /// Parse `GitObjType` from `&str`
     fn from_str(s: &str) -> io::Result<Self> {
         match s {
-            "blob" => Ok(ObjType::Blob),
-            "commit" => Ok(ObjType::Commit),
-            "tag" => Ok(ObjType::Tag),
-            "tree" => Ok(ObjType::Tree),
+            "blob" => Ok(GitObjType::Blob),
+            "commit" => Ok(GitObjType::Commit),
+            "tag" => Ok(GitObjType::Tag),
+            "tree" => Ok(GitObjType::Tree),
             _ => Err(invalid_data_err("invalid object type")),
         }
     }
 }
 
-impl ObjType {
+impl GitObjType {
     /// Parse from byte slice
     pub fn from_bytes(slice: &[u8]) -> io::Result<Self> {
         let res_s = str::from_utf8(slice);
@@ -71,11 +87,11 @@ impl ObjType {
     }
 }
 
-impl Obj {
+impl GitObj {
     /// Find the path of a git object from its hash in a given
     /// repository. This always succeeds, since it does not check if
     /// the object exists.
-    pub fn find_in_repo(repo: &Path, hash: &ObjHash) -> PathBuf {
+    pub fn find_in_repo(repo: &Path, hash: &GitHash) -> PathBuf {
         let objs = repo.join(GIT_DIR.to_os_string()).join("objects");
         let hash = hash.to_string();
         let (obj_dir, obj_file) = hash.split_at(2);
@@ -83,21 +99,21 @@ impl Obj {
         objs.join(obj_dir).join(obj_file)
     }
 
-    /// Like `Obj::find_in_repo()`, but locates the repository with
+    /// Like `GitObj::find_in_repo()`, but locates the repository with
     /// `find_repo()`
-    pub fn find(hash: &ObjHash) -> io::Result<PathBuf> {
-        Ok(Obj::find_in_repo(&find_repo()?, hash))
+    pub fn find(hash: &GitHash) -> io::Result<PathBuf> {
+        Ok(GitObj::find_in_repo(&find_repo()?, hash))
     }
 
     /// Read the git object with hash `hash` in repo `repo`
-    pub fn read_in_repo(repo: &Path, hash: &ObjHash) -> io::Result<Self> {
-        let path = Obj::find_in_repo(repo, hash);
+    pub fn read_in_repo(repo: &Path, hash: &GitHash) -> io::Result<Self> {
+        let path = GitObj::find_in_repo(repo, hash);
         let file = File::open(path)?;
 
         // Read bytes of decompressed object
-        let bytes = zlib::Decoder::new(file)
+        let bytes = zlib::Decoder::new(file)?
             .bytes()
-            .collect::<Result<Vec<u8>, _>>()?;
+            .collect::<io::Result<Vec<u8>>>()?;
 
         // Split object at null byte
         let (header, data) = split_once(&bytes, |&b| b == b'\x00')
@@ -117,7 +133,7 @@ impl Obj {
             .map_err(|_| invalid_data_err("git object size is not an integer"))?;
 
         // Parse object type
-        let typ = ObjType::from_bytes(typ)?;
+        let typ = GitObjType::from_bytes(typ)?;
 
         let data = data.to_vec();
 
@@ -128,10 +144,56 @@ impl Obj {
         }
     }
 
-    /// Like `Obj::read_in_repo()`, but locates the repository with
+    /// Like `GitObj::read_in_repo()`, but locates the repository with
     /// `find_repo()`
-    pub fn read(hash: &ObjHash) -> io::Result<Self> {
-        Obj::read_in_repo(&find_repo()?, hash)
+    pub fn read(hash: &GitHash) -> io::Result<Self> {
+        Self::read_in_repo(&find_repo()?, hash)
+    }
+
+    /// Write the object serialized and zipped to the git directory in
+    /// a given repository (usually stored in `repo/.git/objects/xx/xxxxxx...`)
+    pub fn write_in_repo(&self, repo: &Path) -> io::Result<()> {
+        let hash = self.hash();
+        let path = Self::find_in_repo(repo, &hash);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let file = File::create(path)?;
+
+        let mut encoder = zlib::Encoder::new(file)?;
+        let mut bytes = self.serialize();
+        encoder.write_all(&mut bytes)?;
+        encoder.finish();
+        Ok(())
+    }
+
+    /// Like `GitObj::write_in_repo()`, but locates the repository
+    /// with `find_repo()`
+    pub fn write(&self) -> io::Result<()> {
+        self.write_in_repo(&find_repo()?)
+    }
+
+    /// Get an object's serialized bytes
+    pub fn serialize(&self) -> Vec<u8> {
+        let typ = self.typ.to_string();
+        let typ = typ.bytes();
+
+        let data = self.data.iter().cloned();
+
+        let size = self.data.len().to_string();
+        let size = size.bytes();
+
+        typ.chain(iter::once(b' '))
+            .chain(size)
+            .chain(iter::once(b'\x00'))
+            .chain(data)
+            .collect()
+    }
+
+    /// Compute the hash of an object
+    pub fn hash(&self) -> GitHash {
+        let bytes = self.serialize();
+        GitHasher::from(bytes).digest()
     }
 }
 
@@ -196,4 +258,20 @@ pub fn init(dir: &Path) -> io::Result<()> {
     fs::write(git_dir.join("HEAD"), DEFAULT_HEAD)?;
 
     Ok(())
+}
+
+/// Compute the hash that an object containing the data in a given
+/// file would have, optionally creating the object in the git
+/// directory. This corresponds to `git hash-object`.
+///
+/// * `path` - path to the file
+/// * `typ` - type of the object
+/// * `do_write` - whether to create the object
+pub fn hash_object(path: &Path, typ: GitObjType, do_write: bool) -> io::Result<GitHash> {
+    let data = fs::read(path)?;
+    let obj = GitObj { typ, data };
+    if do_write {
+        obj.write()?;
+    }
+    Ok(obj.hash())
 }
