@@ -1,6 +1,7 @@
 extern crate libtoygit;
 #[macro_use]
 extern crate clap;
+extern crate env_logger;
 extern crate string_error;
 
 use std::boxed::Box;
@@ -8,7 +9,7 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::path::Path;
 
-use libtoygit::{GitHash, GitObj, GitObjType};
+use libtoygit::{GitHash, GitLog, GitObj, GitObjType};
 
 use clap::{AppSettings, Arg, ArgMatches, SubCommand};
 
@@ -36,8 +37,8 @@ fn git_cat_file(args: &ArgMatches) -> Result<()> {
 
     let obj = GitObj::read(&hash)?;
 
-    if obj.typ == typ {
-        io::stdout().write_all(&obj.data)?;
+    if obj.typ() == typ {
+        io::stdout().write_all(&obj.data())?;
         Ok(())
     } else {
         error("object does not have specified type")
@@ -56,6 +57,14 @@ fn git_hash_object(args: &ArgMatches) -> Result<()> {
     let hash = libtoygit::hash_object(path, typ, do_write)?;
 
     println!("{}", hash);
+    Ok(())
+}
+
+fn git_log() -> Result<()> {
+    let log = GitLog::new()?;
+    for commit in log {
+        println!("{:?}", commit?);
+    }
     Ok(())
 }
 
@@ -94,6 +103,7 @@ fn make_clap_app() -> clap::App<'static, 'static> {
                 )
                 .arg(Arg::with_name("file").required(true)),
         )
+        .subcommand(SubCommand::with_name("log").about("Show commit logs"))
 }
 
 // Convenience wrapper function around `string_error`
@@ -102,12 +112,15 @@ fn error(msg: &'static str) -> Result<()> {
 }
 
 fn try_main() -> Result<()> {
+    env_logger::init();
+
     let args = make_clap_app().get_matches();
 
     match args.subcommand() {
         ("init", Some(args)) => git_init(args),
         ("cat-file", Some(args)) => git_cat_file(args),
         ("hash-object", Some(args)) => git_hash_object(args),
+        ("log", _) => git_log(),
         _ => error("unrecognized subcommand"),
     }
 }
