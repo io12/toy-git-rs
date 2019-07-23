@@ -165,23 +165,6 @@ pub struct GitKeyValMsg {
     pub msg: String,
 }
 
-/// A git object
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitObj {
-    Blob(GitBlob),
-    Commit(GitCommit),
-    Tag(GitTag),
-    Tree(GitTree),
-}
-
-/// A key value mapping with a message. This is used for commits and
-/// tags.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitKeyValMsg {
-    pub map: IndexMap<String, String>,
-    pub msg: String,
-}
-
 const DEFAULT_DESCRIPTION: &str =
     "Unnamed repository; edit this file 'description' to name the repository.\n";
 const DEFAULT_HEAD: &str = "ref: refs/heads/master\n";
