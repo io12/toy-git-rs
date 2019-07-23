@@ -11,12 +11,13 @@ extern crate tini;
 
 use std::convert::TryFrom;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::iter::{self, Iterator};
-use std::marker::Sized;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 
@@ -28,6 +29,29 @@ pub use sha1::Digest as GitHash;
 pub use sha1::Sha1 as GitHasher;
 use tini::Ini;
 
+/// Length of byte representation of `GitHash`
+pub const HASH_LEN: usize = 20;
+
+/// An iterator over nodes of a git tree.
+#[derive(Debug)]
+pub struct WalkTree {
+    item_stack: Vec<WalkTreeItem>,
+}
+
+/// Type returned by iterating over `WalkTree`. It contains a
+/// `GitTreeNode` and the path to its parent.
+#[derive(Debug)]
+pub struct WalkTreeItem {
+    /// Tree node
+    pub node: GitTreeNode,
+    /// Path to node's parent relative to the repository. Note that
+    /// `GitTreeNode` only stores the filename, which is why this is
+    /// needed.
+    pub parent_path: PathBuf,
+    /// Path to repository
+    pub repo: PathBuf,
+}
+
 /// An iterator (log) of commits. This corresponds to `git log`.
 #[derive(Debug)]
 pub struct GitLog {
@@ -37,21 +61,22 @@ pub struct GitLog {
     repo: PathBuf,
 }
 
-/// `GitRef` helper type
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitRefInner {
-    Hash(GitHash),
-    Ref(PathBuf),
-}
-
 /// A git reference. This is the parsed version of a text file which
 /// can either be a SHA1 hash or a path to another reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitRef {
-    /// Repository containing the reference
-    pub repo: PathBuf,
-    /// Inner reference information
-    pub inner: GitRefInner,
+pub enum GitRef {
+    Hash {
+        /// Repository containing the reference
+        repo: PathBuf,
+        /// An object hash
+        hash: GitHash,
+    },
+    Ref {
+        /// Repository containing the reference
+        repo: PathBuf,
+        /// Path to next reference
+        path: PathBuf,
+    },
 }
 
 /// The type of a git object
@@ -65,27 +90,79 @@ pub enum GitObjType {
 
 /// A git blob object
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitBlob(Vec<u8>);
+pub struct GitBlob {
+    /// Data in blob
+    pub data: Vec<u8>,
+    /// Path to repository
+    pub repo: PathBuf,
+}
 
 /// A git commit object
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitCommit(GitKeyValMsg);
+pub struct GitCommit {
+    /// Commit data
+    pub data: GitKeyValMsg,
+    /// Path to repository
+    pub repo: PathBuf,
+}
 
 /// A git tag object
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitTag(GitKeyValMsg);
+pub struct GitTag {
+    /// Commit data
+    pub data: GitKeyValMsg,
+    /// Path to repository
+    pub repo: PathBuf,
+}
+
+/// Node of a git tree object. This represents a file or directory in
+/// a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitTreeNode {
+    /// Permission bits
+    pub mode: fs::Permissions,
+    /// Name of file or directory
+    pub filename: OsString,
+    /// Hash of a git object, which can be either a tree (for
+    /// directories) or a blob (for files)
+    pub hash: GitHash,
+}
 
 /// A git tree object
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitTree {
-    // TODO
+    /// Nodes of the tree
+    pub nodes: Vec<GitTreeNode>,
+    /// Path to repository
+    pub repo: PathBuf,
 }
 
 /// A raw, untyped git object
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitObjRaw {
+    /// Type of object
     pub typ: GitObjType,
+    /// Raw bytes of object body
     pub data: Vec<u8>,
+    /// Path to repository
+    pub repo: PathBuf,
+}
+
+/// A git object
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitObj {
+    Blob(GitBlob),
+    Commit(GitCommit),
+    Tag(GitTag),
+    Tree(GitTree),
+}
+
+/// A key value mapping with a message. This is used for commits and
+/// tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitKeyValMsg {
+    pub map: IndexMap<String, String>,
+    pub msg: String,
 }
 
 /// A git object
@@ -119,14 +196,53 @@ lazy_static! {
         .item("logallrefupdates", "true");
 }
 
-/// Trait for types which can be serialized to or deserialized from
-/// files used by git.
-pub trait GitData: Sized {
-    /// Get data's serialized bytes
-    fn serialize(&self) -> Vec<u8>;
+impl Iterator for WalkTree {
+    type Item = io::Result<WalkTreeItem>;
 
-    /// Parse from a raw byte stream
-    fn deserialize(bytes: &[u8]) -> io::Result<Self>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let opt_item = self.item_stack.pop();
+        match opt_item {
+            Some(item) => match item.children() {
+                Ok(mut children) => {
+                    self.item_stack.append(&mut children);
+                    Some(Ok(item))
+                }
+                Err(err) => Some(Err(err)),
+            },
+            None => None,
+        }
+    }
+}
+
+impl WalkTreeItem {
+    /// Get the path to the file or directory described by the node.
+    /// This path is relative to the repository root.
+    pub fn path(&self) -> PathBuf {
+        let filename = self.node.filename.to_os_string();
+        self.parent_path.join(filename)
+    }
+
+    /// Get a list of the node's children. If this node is not a
+    /// directory, then the returned vector is empty.
+    pub fn children(&self) -> io::Result<Vec<Self>> {
+        let obj = GitObj::read_in_repo(&self.repo, &self.node.hash)?;
+
+        match obj {
+            // Node is file
+            GitObj::Blob(_) => Ok(Vec::new()),
+            // Node is directory
+            GitObj::Tree(tree) => Ok(tree
+                .nodes
+                .iter()
+                .map(|node| Self {
+                    node: node.clone(),
+                    parent_path: self.path(),
+                    repo: self.repo.clone(),
+                })
+                .collect()),
+            _ => Err(obj_mismatch_err()),
+        }
+    }
 }
 
 impl GitLog {
@@ -199,9 +315,9 @@ impl GitRef {
 
     /// Recursively follow reference, yielding target object
     pub fn telescope(&self) -> io::Result<GitObj> {
-        match &self.inner {
-            GitRefInner::Hash(hash) => GitObj::read_in_repo(&self.repo, &hash),
-            GitRefInner::Ref(path) => GitRef::read_in_repo(&self.repo, &path)?.telescope(),
+        match self {
+            GitRef::Hash { hash, repo } => GitObj::read_in_repo(&repo, &hash),
+            GitRef::Ref { path, repo } => GitRef::read_in_repo(&repo, &path)?.telescope(),
         }
     }
 
@@ -211,10 +327,7 @@ impl GitRef {
         let path = repo.join(git_dir).join(path);
 
         debug!("reading file: {:?}", path);
-        Ok(Self {
-            repo: repo.to_path_buf(),
-            inner: GitRefInner::deserialize(&fs::read(path)?)?,
-        })
+        Self::from_bytes(&fs::read(path)?, repo)
     }
 
     /// Like `GitRef::read_in_repo()`, but locate the repo with
@@ -238,45 +351,46 @@ impl GitRef {
     }
 }
 
-impl FromStr for GitRefInner {
-    type Err = io::Error;
+impl GitRef {
+    pub fn from_str(s: &str, repo: &Path) -> io::Result<Self> {
+        let repo = repo.to_path_buf();
 
-    fn from_str(s: &str) -> io::Result<Self> {
         match s.split(' ').next_tuple() {
-            Some(("ref:", path)) => {
-                let path = path.trim();
-                let path = PathBuf::from(path);
-                let inner = GitRefInner::Ref(path);
-                Ok(inner)
-            }
+            Some(("ref:", path)) => Ok(GitRef::Ref {
+                path: PathBuf::from(path.trim()),
+                repo,
+            }),
             _ => {
                 let hash = s.trim();
                 let hash = GitHash::from_str(hash);
                 let hash = hash.map_err(|_| GitRef::error())?;
-                let inner = GitRefInner::Hash(hash);
-                Ok(inner)
+                let hash = GitRef::Hash { hash, repo };
+                Ok(hash)
             }
         }
     }
 }
 
-impl fmt::Display for GitRefInner {
+impl fmt::Display for GitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GitRefInner::Hash(hash) => write!(f, "{}", hash),
-            GitRefInner::Ref(path) => write!(f, "{}", path.display()),
+            GitRef::Hash { hash, .. } => write!(f, "{}", hash),
+            GitRef::Ref { path, .. } => write!(f, "{}", path.display()),
         }
     }
 }
 
 // TODO: remove boilerplate with derive
-impl GitData for GitRefInner {
-    fn serialize(&self) -> Vec<u8> {
+impl GitRef {
+    pub fn to_bytes(&self) -> Vec<u8> {
         self.to_string().bytes().collect()
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        str::from_utf8(bytes).map_err(|_| GitRef::error())?.parse()
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        let res = str::from_utf8(bytes);
+        let res = res.map_err(|_| GitRef::error());
+        let s = res?;
+        Self::from_str(s, repo)
     }
 }
 
@@ -292,7 +406,7 @@ impl GitObj {
             .bytes()
             .collect::<io::Result<Vec<u8>>>()?;
 
-        Self::deserialize(&bytes)
+        Self::from_bytes(&bytes, repo)
     }
 
     /// Like `GitObj::read_in_repo()`, but locates the repository with
@@ -314,7 +428,7 @@ impl GitObj {
         let file = File::create(path)?;
 
         let mut encoder = zlib::Encoder::new(file)?;
-        let mut bytes = self.serialize();
+        let mut bytes = self.to_bytes();
         encoder.write_all(&mut bytes)?;
         encoder.finish();
         Ok(())
@@ -328,7 +442,7 @@ impl GitObj {
 
     /// Compute the hash of an object
     pub fn hash(&self) -> GitHash {
-        let bytes = self.serialize();
+        let bytes = self.to_bytes();
         GitHasher::from(bytes).digest()
     }
 
@@ -379,12 +493,12 @@ impl FromStr for GitKeyValMsg {
     }
 }
 
-impl GitData for GitKeyValMsg {
-    fn serialize(&self) -> Vec<u8> {
+impl GitKeyValMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
         self.to_string().bytes().collect()
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         str::from_utf8(bytes).map_err(|_| Self::error())?.parse()
     }
 }
@@ -436,13 +550,99 @@ impl TryFrom<&[u8]> for GitObjType {
     }
 }
 
-impl GitData for GitObj {
-    fn serialize(&self) -> Vec<u8> {
-        GitObjRaw::from(self.clone()).serialize()
+impl GitTreeNode {
+    fn error() -> io::Error {
+        invalid_data_err("invalid tree node")
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        let raw = GitObjRaw::deserialize(bytes)?;
+    /// Given a byte slice containing an encoded `GitTreeNode`, find
+    /// its size in bytes.
+    fn byte_bound(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .iter()
+            .position(|&b| b == b'\x00')
+            .map(|n| n + HASH_LEN)
+            .filter(|&n| n < bytes.len())
+    }
+
+    /// Deserialize a `GitTreeNode` from bytes, returning the
+    /// `GitTreeNode` and the rest of the bytes
+    fn from_bytes_rest<'a>(bytes: &'a [u8]) -> io::Result<(GitTreeNode, &'a [u8])> {
+        let opt_n = GitTreeNode::byte_bound(bytes);
+        match opt_n {
+            Some(n) => {
+                let (node_bytes, rest) = bytes.split_at(n);
+                let node = GitTreeNode::from_bytes(node_bytes)?;
+                Ok((node, rest))
+            }
+            None => Err(GitTreeNode::error()),
+        }
+    }
+
+    /// Deserialize `GitTreeNode`s from a byte slice
+    fn from_bytes_nodes(mut bytes: &[u8]) -> io::Result<Vec<Self>> {
+        let mut ret = Vec::new();
+        while bytes.len() != 0 {
+            let (node, rest) = Self::from_bytes_rest(bytes)?;
+            bytes = rest;
+            ret.push(node);
+        }
+        Ok(ret)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mode = self.mode.mode();
+        let mode = mode.to_string();
+        let mode = mode.bytes();
+
+        let path = self.filename.as_bytes().iter().cloned();
+
+        let hash = self.hash.bytes();
+        let hash = hash.iter().cloned();
+
+        mode.chain(iter::once(b' '))
+            .chain(path)
+            .chain(iter::once(b'\x00'))
+            .chain(hash)
+            .collect()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let toks = bytes.split(|&b| b == b' ' || b == b'\x00').next_tuple();
+        match toks {
+            Some((mode, filename, hash)) => {
+                // TODO: Refactor
+                let mode = str::from_utf8(mode);
+                let mode = mode.map_err(|_| Self::error())?;
+                let mode = mode.parse::<u32>();
+                let mode = mode.map_err(|_| Self::error())?;
+                let mode = fs::Permissions::from_mode(mode);
+
+                let filename = OsStr::from_bytes(filename).to_os_string();
+
+                let hash = str::from_utf8(hash);
+                let hash = hash.map_err(|_| Self::error())?;
+                let hash = GitHash::from_str(hash);
+                let hash = hash.map_err(|_| Self::error())?;
+
+                Ok(Self {
+                    mode,
+                    filename,
+                    hash,
+                })
+            }
+            None => Err(Self::error()),
+        }
+    }
+}
+
+impl GitObj {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        GitObjRaw::from(self.clone()).to_bytes()
+    }
+
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        let raw = GitObjRaw::from_bytes(bytes, repo)?;
         let obj = GitObj::try_from(raw)?;
         Ok(obj)
     }
@@ -461,10 +661,11 @@ impl From<GitObj> for GitObjRaw {
 
 impl From<GitBlob> for GitObjRaw {
     fn from(obj: GitBlob) -> Self {
-        let typ = GitObjType::Blob;
-        let GitBlob(data) = obj;
-
-        Self { typ, data }
+        Self {
+            typ: GitObjType::Blob,
+            data: obj.data,
+            repo: obj.repo,
+        }
     }
 }
 
@@ -473,26 +674,45 @@ impl TryFrom<GitObjRaw> for GitBlob {
 
     fn try_from(obj: GitObjRaw) -> io::Result<Self> {
         if obj.typ == GitObjType::Blob {
-            Ok(GitBlob(obj.data))
+            Ok(GitBlob {
+                data: obj.data,
+                repo: obj.repo,
+            })
         } else {
             Err(obj_mismatch_err())
         }
     }
 }
 
-impl GitData for GitBlob {
-    fn serialize(&self) -> Vec<u8> {
-        GitObjRaw::from(self.clone()).serialize()
+impl GitBlob {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        GitObjRaw::from(self.clone()).to_bytes()
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        let raw = GitObjRaw::deserialize(bytes)?;
-        let blob = GitBlob(raw.data);
-        Ok(blob)
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        let raw = GitObjRaw::from_bytes(bytes, repo)?;
+        if raw.typ == GitObjType::Blob {
+            Ok(GitBlob {
+                data: raw.data,
+                repo: raw.repo,
+            })
+        } else {
+            Err(obj_mismatch_err())
+        }
     }
 }
 
 impl GitCommit {
+    /// Serialize commit to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        GitObjRaw::from(self.clone()).to_bytes()
+    }
+
+    /// Deserialize commit from bytes
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        GitCommit::try_from(GitObjRaw::from_bytes(bytes, repo)?)
+    }
+
     // TODO: Reduce boilerplate
     pub fn read_in_repo(repo: &Path, hash: &GitHash) -> io::Result<Self> {
         Self::try_from(GitObj::read_in_repo(repo, hash)?)
@@ -505,7 +725,7 @@ impl GitCommit {
     /// * `Some(Err(_))` - error getting parent
     /// * `Some(Ok(_))` parent obtained successfully
     pub fn parent_in_repo(&self, repo: &Path) -> Option<io::Result<Self>> {
-        let hash = self.0.map.get("parent")?;
+        let hash = self.data.map.get("parent")?;
         match GitHash::from_str(hash) {
             Ok(hash) => Some(Self::read_in_repo(repo, &hash)),
             Err(_) => Some(Err(invalid_data_err("hash error"))), // TODO: boilerplate?
@@ -528,15 +748,34 @@ impl GitCommit {
     pub fn head() -> io::Result<Self> {
         Self::head_in_repo(&find_repo()?)
     }
+
+    /// Get the commit's tree
+    pub fn tree(&self) -> io::Result<GitTree> {
+        let hash = self
+            .data
+            .map
+            .get("tree")
+            .ok_or_else(|| invalid_data_err("commit has no tree"))?;
+        let hash = GitHash::from_str(hash).map_err(|_| invalid_data_err("hash error"))?; // TODO: Remove boilerplate
+        let obj = GitObj::read_in_repo(&self.repo, &hash)?;
+        let tree = GitTree::try_from(GitObjRaw::from(obj))?;
+        Ok(tree)
+    }
+
+    /// Update files in the working tree to the time of a commit. This
+    /// corresponds to `git checkout`.
+    pub fn checkout(&self) -> io::Result<()> {
+        self.tree()?.checkout()
+    }
 }
 
 impl From<GitCommit> for GitObjRaw {
     fn from(obj: GitCommit) -> Self {
-        let typ = GitObjType::Commit;
-        let GitCommit(data) = obj;
-        let data = data.serialize();
-
-        Self { typ, data }
+        Self {
+            typ: GitObjType::Commit,
+            data: obj.data.to_bytes(),
+            repo: obj.repo,
+        }
     }
 }
 
@@ -545,7 +784,10 @@ impl TryFrom<GitObjRaw> for GitCommit {
 
     fn try_from(obj: GitObjRaw) -> io::Result<Self> {
         if obj.typ == GitObjType::Commit {
-            Ok(GitCommit(GitKeyValMsg::deserialize(&obj.data)?))
+            Ok(GitCommit {
+                data: GitKeyValMsg::from_bytes(&obj.data)?,
+                repo: obj.repo,
+            })
         } else {
             Err(obj_mismatch_err())
         }
@@ -564,23 +806,13 @@ impl TryFrom<GitObj> for GitCommit {
     }
 }
 
-impl GitData for GitCommit {
-    fn serialize(&self) -> Vec<u8> {
-        GitObjRaw::from(self.clone()).serialize()
-    }
-
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        GitCommit::try_from(GitObjRaw::deserialize(bytes)?)
-    }
-}
-
 impl From<GitTag> for GitObjRaw {
     fn from(obj: GitTag) -> Self {
-        let typ = GitObjType::Commit;
-        let GitTag(data) = obj;
-        let data = data.serialize();
-
-        Self { typ, data }
+        Self {
+            typ: GitObjType::Commit,
+            data: obj.data.to_bytes(),
+            repo: obj.repo,
+        }
     }
 }
 
@@ -589,49 +821,118 @@ impl TryFrom<GitObjRaw> for GitTag {
 
     fn try_from(obj: GitObjRaw) -> io::Result<Self> {
         if obj.typ == GitObjType::Commit {
-            Ok(GitTag(GitKeyValMsg::deserialize(&obj.data)?))
+            Ok(GitTag {
+                data: GitKeyValMsg::from_bytes(&obj.data)?,
+                repo: obj.repo,
+            })
         } else {
             Err(obj_mismatch_err())
         }
     }
 }
 
-impl GitData for GitTag {
-    fn serialize(&self) -> Vec<u8> {
-        GitObjRaw::from(self.clone()).serialize()
+impl GitTag {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        GitObjRaw::from(self.clone()).to_bytes()
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        GitTag::try_from(GitObjRaw::deserialize(bytes)?)
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        GitTag::try_from(GitObjRaw::from_bytes(bytes, repo)?)
     }
 }
 
 impl From<GitTree> for GitObjRaw {
-    fn from(_obj: GitTree) -> Self {
-        unimplemented!()
+    fn from(obj: GitTree) -> Self {
+        Self {
+            typ: GitObjType::Tree,
+            data: obj
+                .nodes
+                .iter()
+                .map(GitTreeNode::to_bytes)
+                .flatten()
+                .collect::<Vec<u8>>(),
+            repo: obj.repo,
+        }
     }
 }
 
 impl TryFrom<GitObjRaw> for GitTree {
     type Error = io::Error;
 
-    fn try_from(_obj: GitObjRaw) -> io::Result<Self> {
+    fn try_from(obj: GitObjRaw) -> io::Result<Self> {
+        if obj.typ == GitObjType::Tree {
+            Ok(GitTree {
+                nodes: GitTreeNode::from_bytes_nodes(&obj.data)?,
+                repo: obj.repo,
+            })
+        } else {
+            Err(obj_mismatch_err())
+        }
+    }
+}
+
+impl GitTree {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        GitObjRaw::from(self.clone()).to_bytes()
+    }
+
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
+        Self::try_from(GitObjRaw::from_bytes(bytes, repo)?)
+    }
+
+    /// Return an iterator over all nodes of the tree
+    pub fn walk(&self) -> WalkTree {
+        WalkTree {
+            item_stack: self
+                .nodes
+                .iter()
+                .map(|node| WalkTreeItem {
+                    node: node.clone(),
+                    parent_path: PathBuf::from("."), // TODO: Is this okay?
+                    repo: self.repo.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Determines whether the working tree matches this tree
+    pub fn working_same(&self) -> io::Result<bool> {
+        self.walk()
+            .map(|walk_item| {
+                let walk_item = walk_item?;
+                let path = walk_item.path();
+                let hash = walk_item.node.hash;
+                let obj = GitObj::read_in_repo(&self.repo, &hash)?;
+                match obj {
+                    GitObj::Blob(blob) => Ok(fs::read(path)? == blob.data),
+                    GitObj::Tree(tree) => tree.working_same(),
+                    _ => Err(obj_mismatch_err()),
+                }
+            })
+            .fold_results(true, |a, b| a && b)
+    }
+
+    /// Like `GitTree::checkout()`, but without checking the working
+    /// tree.
+    fn do_checkout(&self) -> io::Result<()> {
         unimplemented!()
     }
+
+    /// Modify the working tree to fit this tree, doing checks to
+    /// prevent data loss. This function corresponds to
+    /// `git checkout`.
+    // TODO: Fix the check
+    pub fn checkout(&self) -> io::Result<()> {
+        if self.working_same()? {
+            self.do_checkout()
+        } else {
+            Err(invalid_data_err("working tree dirty"))
+        }
+    }
 }
 
-impl GitData for GitTree {
-    fn serialize(&self) -> Vec<u8> {
-        GitObjRaw::from(self.clone()).serialize()
-    }
-
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
-        Self::try_from(GitObjRaw::deserialize(bytes)?)
-    }
-}
-
-impl GitData for GitObjRaw {
-    fn serialize(&self) -> Vec<u8> {
+impl GitObjRaw {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let typ = self.typ.to_string();
         let typ = typ.bytes();
 
@@ -647,7 +948,7 @@ impl GitData for GitObjRaw {
             .collect()
     }
 
-    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
+    pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
         // Split object at null byte
         let (header, data) = split_once(&bytes, |&b| b == b'\x00')
             .ok_or_else(|| invalid_data_err("no null byte in object"))?;
@@ -665,13 +966,13 @@ impl GitData for GitObjRaw {
             .parse::<usize>()
             .map_err(|_| invalid_data_err("git object size is not an integer"))?;
 
-        // Parse object type
-        let typ = GitObjType::try_from(typ)?;
-
-        let data = data.to_vec();
-
         if data.len() == size {
-            Ok(Self { typ, data })
+            Ok(Self {
+                // Parse object type
+                typ: GitObjType::try_from(typ)?,
+                data: data.to_vec(),
+                repo: repo.to_path_buf(),
+            })
         } else {
             Err(invalid_data_err("git object size corrupted"))
         }
@@ -760,14 +1061,18 @@ pub fn init(dir: &Path) -> io::Result<()> {
 
 /// Compute the hash that an object containing the data in a given
 /// file would have, optionally creating the object in the git
-/// directory. This corresponds to `git hash-object`.
+/// directory. The repository is located with `find_repo()`. This
+/// function corresponds to `git hash-object`.
 ///
 /// * `path` - path to the file
 /// * `typ` - type of the object
 /// * `do_write` - whether to create the object
 pub fn hash_object(path: &Path, typ: GitObjType, do_write: bool) -> io::Result<GitHash> {
-    let data = fs::read(path)?;
-    let obj = GitObjRaw { typ, data };
+    let obj = GitObjRaw {
+        typ,
+        data: fs::read(path)?,
+        repo: find_repo()?,
+    };
     let obj = GitObj::try_from(obj)?;
     if do_write {
         obj.write()?;
