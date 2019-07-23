@@ -9,7 +9,7 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::path::Path;
 
-use libtoygit::{GitHash, GitLog, GitObj, GitObjType};
+use libtoygit as git;
 
 use clap::{AppSettings, Arg, ArgMatches, SubCommand};
 
@@ -29,13 +29,13 @@ fn git_cat_file(args: &ArgMatches) -> Result<()> {
     let typ = args
         .value_of("type")
         .expect("no type")
-        .parse::<GitObjType>()?;
+        .parse::<git::obj::Kind>()?;
     let hash = args
         .value_of("object")
         .expect("no object")
-        .parse::<GitHash>()?;
+        .parse::<git::Hash>()?;
 
-    let obj = GitObj::read(&hash)?;
+    let obj = git::Obj::read(&hash)?;
 
     if obj.typ() == typ {
         io::stdout().write_all(&obj.data())?;
@@ -50,7 +50,7 @@ fn git_hash_object(args: &ArgMatches) -> Result<()> {
     let typ = args
         .value_of("type")
         .expect("no type")
-        .parse::<GitObjType>()?;
+        .parse::<git::obj::Kind>()?;
     let path = args.value_of_os("file").expect("no file");
     let path = Path::new(path);
 
@@ -61,7 +61,7 @@ fn git_hash_object(args: &ArgMatches) -> Result<()> {
 }
 
 fn git_log() -> Result<()> {
-    let log = GitLog::new()?;
+    let log = git::Log::new()?;
     for commit in log {
         println!("{:?}", commit?);
     }
