@@ -2,6 +2,8 @@ use crate::*;
 
 use std::fmt;
 
+use chrono::prelude::*;
+
 /// A git commit object
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -9,6 +11,17 @@ pub struct Commit {
     pub data: KeyValMsg,
     /// Path to repository
     pub repo: PathBuf,
+}
+
+/// Type representing the data held by the `author` and `committer` fields of a
+/// commit
+struct CommitAuthorField {
+    /// The name and email, in the format "John Doe <email@example.com>"
+    name_and_email: String,
+    /// The time of this commit
+    time: NaiveDateTime,
+    /// I have no idea what this is for. Please tell me if you know.
+    other: String,
 }
 
 impl Commit {
@@ -82,19 +95,51 @@ impl Commit {
     pub fn hash(&self) -> Hash {
         Obj::Commit(self.to_owned()).hash()
     }
+
+    /// Retrieve and parse the `author` field
+    fn author_field(&self) -> io::Result<CommitAuthorField> {
+        self.data
+            .map
+            .get("author")
+            .ok_or_else(|| invalid_data_err("commit has no author"))?
+            .parse()
+    }
+}
+
+impl CommitAuthorField {
+    fn error() -> io::Error {
+        invalid_data_err("invalid commit author field")
+    }
+}
+
+impl FromStr for CommitAuthorField {
+    type Err = io::Error;
+
+    fn from_str(s: &str) -> io::Result<Self> {
+        let split = s.find("> ").ok_or_else(|| Self::error())?;
+        let split = split + 1;
+        let (name_and_email, time_other) = s.split_at(split);
+        let (time, other) = time_other
+            .trim()
+            .split_whitespace()
+            .next_tuple()
+            .ok_or_else(|| Self::error())?;
+        let time = time.parse::<i64>().map_err(|_| Self::error())?;
+        let time = NaiveDateTime::from_timestamp_opt(time, 0).ok_or_else(|| Self::error())?;
+        Ok(Self {
+            name_and_email: name_and_email.to_string(),
+            time,
+            other: other.to_string(),
+        })
+    }
 }
 
 impl fmt::Display for Commit {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "commit {}", self.hash())?;
-        if let Some(author_field) = self.data.map.get("author") {
-            if let Some(split) = author_field.find("> ") {
-                let split = split + 1;
-                let (author, date) = author_field.split_at(split);
-                let date = date.trim();
-                writeln!(f, "Author: {}", author)?;
-                writeln!(f, "Date:   {}", date)?;
-            }
+        if let Ok(author) = self.author_field() {
+            writeln!(f, "Author: {}", author.name_and_email)?;
+            writeln!(f, "Date:   {} {}", author.time, author.other)?;
         }
         writeln!(f)?;
         writeln!(f, "    {}", self.data.msg)?;
