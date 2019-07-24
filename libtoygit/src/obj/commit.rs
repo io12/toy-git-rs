@@ -1,6 +1,6 @@
 use crate::*;
 
-use obj::raw::Raw;
+use std::fmt;
 
 /// A git commit object
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,12 +14,12 @@ pub struct Commit {
 impl Commit {
     /// Serialize commit to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
-        Raw::from(self.clone()).to_bytes()
+        obj::Raw::from(self.clone()).to_bytes()
     }
 
     /// Deserialize commit from bytes
     pub fn from_bytes(bytes: &[u8], repo: &Path) -> io::Result<Self> {
-        Commit::try_from(Raw::from_bytes(bytes, repo)?)
+        Commit::try_from(obj::Raw::from_bytes(bytes, repo)?)
     }
 
     // TODO: Reduce boilerplate
@@ -67,7 +67,7 @@ impl Commit {
             .ok_or_else(|| invalid_data_err("commit has no tree"))?;
         let hash = Hash::from_str(hash).map_err(|_| invalid_data_err("hash error"))?; // TODO: Remove boilerplate
         let obj = Obj::read_in_repo(&self.repo, &hash)?;
-        let tree = obj::Tree::try_from(Raw::from(obj))?;
+        let tree = obj::Tree::try_from(obj::Raw::from(obj))?;
         Ok(tree)
     }
 
@@ -75,5 +75,29 @@ impl Commit {
     /// corresponds to `git checkout`.
     pub fn checkout(&self) -> io::Result<()> {
         self.tree()?.checkout()
+    }
+
+    /// Get the hash of a commit object
+    // TODO: try to reduce boilerplate somehow
+    pub fn hash(&self) -> Hash {
+        Obj::Commit(self.to_owned()).hash()
+    }
+}
+
+impl fmt::Display for Commit {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "commit {}", self.hash())?;
+        if let Some(author_field) = self.data.map.get("author") {
+            if let Some(split) = author_field.find("> ") {
+                let split = split + 1;
+                let (author, date) = author_field.split_at(split);
+                let date = date.trim();
+                writeln!(f, "Author: {}", author)?;
+                writeln!(f, "Date:   {}", date)?;
+            }
+        }
+        writeln!(f)?;
+        writeln!(f, "    {}", self.data.msg)?;
+        Ok(())
     }
 }

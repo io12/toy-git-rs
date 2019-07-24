@@ -63,7 +63,7 @@ fn git_hash_object(args: &ArgMatches) -> Result<()> {
 fn git_log() -> Result<()> {
     let log = git::Log::new()?;
     for commit in log {
-        println!("{:?}", commit?);
+        println!("{}", commit?);
     }
     Ok(())
 }
