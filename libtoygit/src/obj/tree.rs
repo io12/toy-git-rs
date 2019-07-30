@@ -73,7 +73,8 @@ impl WalkTreeItem {
     /// This path is relative to the repository root.
     pub fn path(&self) -> PathBuf {
         let filename = self.node.filename.to_os_string();
-        self.parent_path.join(filename)
+        // repo/parent_path/filename
+        self.repo.join(self.parent_path.join(filename))
     }
 
     /// Get a list of the node's children. If this node is not a
