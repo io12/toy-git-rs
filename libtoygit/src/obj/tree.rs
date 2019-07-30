@@ -100,7 +100,7 @@ impl WalkTreeItem {
                 .iter()
                 .map(|node| Self {
                     node: node.clone(),
-                    parent_path: self.path(),
+                    parent_path: self.parent_path.join(&self.node.filename),
                     repo: self.repo.clone(),
                 })
                 .collect()),
