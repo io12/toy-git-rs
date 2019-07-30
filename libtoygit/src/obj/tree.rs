@@ -226,16 +226,14 @@ impl Tree {
                 let path = walk_item.path();
                 let hash = walk_item.node.hash;
                 let obj = Obj::read_in_repo(&self.repo, &hash)?;
-                match obj {
-                    Obj::Blob(blob) => Ok(match fs::read(&path) {
-                        Ok(data) => data == blob.data,
-                        Err(_) => {
-                            debug!("working tree difference at '{}'", path.display());
-                            false
-                        }
-                    }),
-                    Obj::Tree(tree) => tree.working_same(),
-                    _ => Err(obj_mismatch_err()),
+                if let Obj::Blob(blob) = obj {
+                    // Check that file exists in working tree and has same
+                    // contents as blob
+                    Ok(fs::read(&path)
+                        .map(|data| data == blob.data)
+                        .unwrap_or(false))
+                } else {
+                    Err(obj_mismatch_err())
                 }
             })
             .fold_results(true, |a, b| a && b)
