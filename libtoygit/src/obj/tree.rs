@@ -204,6 +204,9 @@ impl Tree {
     }
 
     /// Return an iterator over all nodes of the tree
+    ///
+    /// **NOTE**: Do not call this function recursively on nodes that are
+    /// directories. This function automatically iterates over all nodes.
     pub fn walk(&self) -> WalkTree {
         WalkTree {
             item_stack: self
