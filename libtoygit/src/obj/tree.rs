@@ -217,9 +217,12 @@ impl Tree {
                 let hash = walk_item.node.hash;
                 let obj = Obj::read_in_repo(&self.repo, &hash)?;
                 match obj {
-                    Obj::Blob(blob) => Ok(match fs::read(path) {
+                    Obj::Blob(blob) => Ok(match fs::read(&path) {
                         Ok(data) => data == blob.data,
-                        Err(_) => false,
+                        Err(_) => {
+                            debug!("working tree difference at '{}'", path.display());
+                            false
+                        }
                     }),
                     Obj::Tree(tree) => tree.working_same(),
                     _ => Err(obj_mismatch_err()),
