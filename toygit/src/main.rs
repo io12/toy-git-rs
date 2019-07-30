@@ -5,6 +5,7 @@ extern crate env_logger;
 extern crate string_error;
 
 use std::boxed::Box;
+use std::convert::TryFrom;
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::Path;
@@ -68,6 +69,22 @@ fn git_log() -> Result<()> {
     Ok(())
 }
 
+fn git_checkout(args: &ArgMatches) -> Result<()> {
+    let hash = args
+        .value_of("commit")
+        .expect("no commit")
+        .parse::<git::Hash>()?;
+
+    // TODO: This can hopefully be done better
+    let obj = git::Obj::read(&hash)?;
+    let raw = git::obj::Raw::from(obj);
+    let commit = git::obj::Commit::try_from(raw)?;
+    let tree = commit.tree()?;
+
+    tree.checkout()?;
+    Ok(())
+}
+
 fn make_clap_app() -> clap::App<'static, 'static> {
     app_from_crate!()
         .setting(AppSettings::ArgRequiredElseHelp)
@@ -104,6 +121,11 @@ fn make_clap_app() -> clap::App<'static, 'static> {
                 .arg(Arg::with_name("file").required(true)),
         )
         .subcommand(SubCommand::with_name("log").about("Show commit logs"))
+        .subcommand(
+            SubCommand::with_name("checkout")
+                .about("Switch branches or restore working tree files")
+                .arg(Arg::with_name("commit").required(true)),
+        )
 }
 
 // Convenience wrapper function around `string_error`
@@ -121,6 +143,7 @@ fn try_main() -> Result<()> {
         ("cat-file", Some(args)) => git_cat_file(args),
         ("hash-object", Some(args)) => git_hash_object(args),
         ("log", _) => git_log(),
+        ("checkout", Some(args)) => git_checkout(args),
         _ => error("unrecognized subcommand"),
     }
 }

@@ -6,6 +6,8 @@ use std::fs;
 use std::iter;
 use std::os::unix::fs::PermissionsExt;
 
+use walkdir::WalkDir;
+
 /// Node of a git tree object. This represents a file or directory in
 /// a tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +120,7 @@ impl Node {
         let opt_n = Node::byte_bound(bytes);
         match opt_n {
             Some(n) => {
-                let (node_bytes, rest) = bytes.split_at(n);
+                let (node_bytes, rest) = bytes.split_at(n + 1);
                 let node = Node::from_bytes(node_bytes)?;
                 Ok((node, rest))
             }
@@ -155,7 +157,7 @@ impl Node {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-        let toks = bytes.split(|&b| b == b' ' || b == b'\x00').next_tuple();
+        let toks = bytes.splitn(3, |&b| b == b' ' || b == b'\x00').next_tuple();
         match toks {
             Some((mode, filename, hash)) => {
                 // TODO: Refactor
@@ -167,9 +169,8 @@ impl Node {
 
                 let filename = OsStr::from_bytes(filename).to_os_string();
 
-                let hash = str::from_utf8(hash);
-                let hash = hash.map_err(|_| Self::error())?;
-                let hash = Hash::from_str(hash);
+                let hash = hex::encode(hash);
+                let hash = Hash::from_str(&hash);
                 let hash = hash.map_err(|_| Self::error())?;
 
                 Ok(Self {
@@ -216,7 +217,10 @@ impl Tree {
                 let hash = walk_item.node.hash;
                 let obj = Obj::read_in_repo(&self.repo, &hash)?;
                 match obj {
-                    Obj::Blob(blob) => Ok(fs::read(path)? == blob.data),
+                    Obj::Blob(blob) => Ok(match fs::read(path) {
+                        Ok(data) => data == blob.data,
+                        Err(_) => false,
+                    }),
                     Obj::Tree(tree) => tree.working_same(),
                     _ => Err(obj_mismatch_err()),
                 }
@@ -227,7 +231,20 @@ impl Tree {
     /// Like `Tree::checkout()`, but without checking the working
     /// tree.
     fn do_checkout(&self) -> io::Result<()> {
-        unimplemented!()
+        let repo = &self.repo;
+
+        // Remove all files in the working tree
+        let w = WalkDir::new(repo)
+            .into_iter()
+            .filter_entry(|ent| ent.file_name() != *GIT_DIR);
+        for ent in w {
+            let ent = ent?;
+            let path = ent.path();
+
+            debug!("removing file '{}'", path.display());
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
 
     /// Modify the working tree to fit this tree, doing checks to
@@ -235,7 +252,10 @@ impl Tree {
     /// `git checkout`.
     // TODO: Fix the check
     pub fn checkout(&self) -> io::Result<()> {
-        if self.working_same()? {
+        let head = obj::Commit::head_in_repo(&self.repo)?;
+        // Whether the working tree is dirty
+        let working_dirty = head.tree()?.working_same()?;
+        if working_dirty {
             self.do_checkout()
         } else {
             Err(invalid_data_err("working tree dirty"))
