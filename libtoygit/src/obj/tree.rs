@@ -222,6 +222,7 @@ impl Tree {
     }
 
     /// Determines whether the working tree matches this tree
+    // TODO: Make this not bad
     pub fn working_same(&self) -> io::Result<bool> {
         self.walk()
             .map(|walk_item| {
